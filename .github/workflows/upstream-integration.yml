@@ -92,90 +92,90 @@ jobs:
           #include <linux/seccomp.h>
           int __secure_computing(const struct seccomp_data *sd)
           {
-              int mode = current->seccomp.mode;
-              int this_syscall;
-              this_syscall = sd ? sd->nr :
-                  syscall_get_nr(current, current_pt_regs());
-              return mode + this_syscall;
+          \tint mode = current->seccomp.mode;
+          \tint this_syscall;
+          \tthis_syscall = sd ? sd->nr :
+          \t\tsyscall_get_nr(current, current_pt_regs());
+          \treturn mode + this_syscall;
           }
           EOF
           cat > "$common/fs/namespace.c" <<'EOF'
           #include <linux/mount.h>
           static int do_loopback(struct path *path, const char *old_name, int recurse)
           {
-              struct path old_path;
-              int err;
-              err = kern_path(old_name, LOOKUP_FOLLOW|LOOKUP_AUTOMOUNT, &old_path);
-              if (err)
-                  return err;
-              err = 0;
+          \tstruct path old_path;
+          \tint err;
+          \terr = kern_path(old_name, LOOKUP_FOLLOW|LOOKUP_AUTOMOUNT, &old_path);
+          \tif (err)
+          \t\treturn err;
+          \terr = 0;
           out:
-              path_put(&old_path);
-              return err;
+          \tpath_put(&old_path);
+          \treturn err;
           }
           static int can_umount(const struct path *path, int flags)
           {
-              if (!may_mount())
-                  return -EPERM;
-              return 0;
+          \tif (!may_mount())
+          \t\treturn -EPERM;
+          \treturn 0;
           }
           int path_umount(struct path *path, int flags)
           {
-              struct mount *mnt = real_mount(path->mnt);
-              int ret;
-              ret = can_umount(path, flags);
-              if (!ret)
-                  ret = do_umount(mnt, flags);
-              return ret;
+          \tstruct mount *mnt = real_mount(path->mnt);
+          \tint ret;
+          \tret = can_umount(path, flags);
+          \tif (!ret)
+          \t\tret = do_umount(mnt, flags);
+          \treturn ret;
           }
           static inline bool may_mount(void)
           {
-              return capable(CAP_SYS_ADMIN);
+          \treturn capable(CAP_SYS_ADMIN);
           }
           int path_mount(const char *dev_name, struct path *path,
-                         const char *type_page, unsigned long flags, void *data_page)
+          \t\tconst char *type_page, unsigned long flags, void *data_page)
           {
-              unsigned int mnt_flags = 0, sb_flags = 0;
-              int ret;
-              ret = security_sb_mount(dev_name, path, type_page, flags, data_page);
-              if (ret)
-                  return ret;
-              if (!may_mount())
-                  return -EPERM;
-              if (flags & MS_BIND)
-                  return do_loopback(path, dev_name, flags & MS_REC);
-              return do_new_mount(path, type_page, sb_flags, mnt_flags, dev_name,
-                                  data_page);
+          \tunsigned int mnt_flags = 0, sb_flags = 0;
+          \tint ret;
+          \tret = security_sb_mount(dev_name, path, type_page, flags, data_page);
+          \tif (ret)
+          \t\treturn ret;
+          \tif (!may_mount())
+          \t\treturn -EPERM;
+          \tif (flags & MS_BIND)
+          \t\treturn do_loopback(path, dev_name, flags & MS_REC);
+          \treturn do_new_mount(path, type_page, sb_flags, mnt_flags, dev_name,
+          \t\t\t    data_page);
           }
           EOF
           cat > "$common/kernel/ptrace.c" <<'EOF'
           #include <linux/ptrace.h>
           static int ptrace_may_access(struct task_struct *task)
           {
-              const struct cred *tcred;
-              struct mm_struct *mm = task->mm;
-              unsigned int mode = 0;
-              tcred = __task_cred(task);
-              if (uid_eq(current_uid(), tcred->uid))
-                  goto ok;
-              return -EPERM;
+          \tconst struct cred *tcred;
+          \tstruct mm_struct *mm = task->mm;
+          \tunsigned int mode = 0;
+          \ttcred = __task_cred(task);
+          \tif (uid_eq(current_uid(), tcred->uid))
+          \t\tgoto ok;
+          \treturn -EPERM;
           ok:
-              if (mm &&
-                  ((get_dumpable(mm) != SUID_DUMP_USER) &&
-                   !ptrace_has_cap(mm->user_ns, mode)))
-                  return -EPERM;
-              return 0;
+          \tif (mm &&
+          \t    ((get_dumpable(mm) != SUID_DUMP_USER) &&
+          \t     !ptrace_has_cap(mm->user_ns, mode)))
+          \t\treturn -EPERM;
+          \treturn 0;
           }
           EOF
           cat > "$common/kernel/signal.c" <<'EOF'
           #include <linux/sched/signal.h>
           static int check_kill_permission(struct task_struct *t)
           {
-              if (!same_thread_group(current, t) &&
-                  !kill_ok_by_cred(t)) {
-                  return -EPERM;
-              }
-              return 0;
+          \tif (!same_thread_group(current, t) &&
+          \t    !kill_ok_by_cred(t)) {
+          \t\treturn -EPERM;
+          \t}
+          \treturn 0;
           }
           EOF
           if [[ "$KERNEL_LINE" == 6.12 ]]; then
@@ -190,10 +190,26 @@ jobs:
            *  There is a trailing comma that we need to be accounted for.
           */
           #define MAX_LSM_COUNT \
-              COUNT_LSMS( \
-                  IPE_ENABLED)
+          \tCOUNT_LSMS( \
+          \t\tIPE_ENABLED)
           EOF
           fi
+          python3 - "$common" <<'PY'
+          import sys
+          from pathlib import Path
+
+          common = Path(sys.argv[1])
+          for relative in (
+              "kernel/seccomp.c",
+              "fs/namespace.c",
+              "kernel/ptrace.c",
+              "kernel/signal.c",
+              "include/linux/lsm_count.h",
+          ):
+              path = common / relative
+              if path.exists():
+                  path.write_text(path.read_text().replace("\\t", "\t"))
+          PY
           printf '%s\n' \
             'CONFIG_KSU=y' \
             'CONFIG_SECURITY_SELINUX=y' \
