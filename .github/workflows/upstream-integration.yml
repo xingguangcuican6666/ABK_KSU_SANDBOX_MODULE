@@ -1,0 +1,349 @@
+name: Pinned KSU upstream integration
+
+on:
+  push:
+    paths:
+      - 'files/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'setup.sh'
+      - 'module.conf'
+      - '.github/workflows/upstream-integration.yml'
+  pull_request:
+    paths:
+      - 'files/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'setup.sh'
+      - 'module.conf'
+      - '.github/workflows/upstream-integration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inject:
+    name: ${{ matrix.ksu.name }} / synthetic Linux ${{ matrix.kernel }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ['6.6', '6.12']
+        ksu:
+          - name: kernelsu
+            detected: official
+            repository: https://github.com/tiann/KernelSU.git
+            commit: 953b403ab5ea2c1d866f72f6a7e67ce9224b8932
+          - name: sukisu-ultra
+            detected: sukisu
+            repository: https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
+            commit: 35467545b2826e3acfc88699755981a889956b1a
+          - name: resukisu
+            detected: resukisu
+            repository: https://github.com/ReSukiSU/ReSukiSU.git
+            commit: d5ba3d2d51a4c5b41a182112faa13c02b98e31a1
+    steps:
+      - name: Check out module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Fetch exact upstream commit
+        env:
+          UPSTREAM_REPOSITORY: ${{ matrix.ksu.repository }}
+          UPSTREAM_COMMIT: ${{ matrix.ksu.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_dir="$RUNNER_TEMP/ksu-upstream"
+          git init "$upstream_dir"
+          git -C "$upstream_dir" remote add origin "$UPSTREAM_REPOSITORY"
+          git -C "$upstream_dir" fetch --depth=1 origin "$UPSTREAM_COMMIT"
+          git -C "$upstream_dir" checkout --detach FETCH_HEAD
+          actual_commit="$(git -C "$upstream_dir" rev-parse HEAD)"
+          test "$actual_commit" = "$UPSTREAM_COMMIT" || {
+            echo "Pinned commit mismatch: expected $UPSTREAM_COMMIT, got $actual_commit" >&2
+            exit 1
+          }
+
+      - name: Create minimal built-in kernel tree
+        env:
+          KERNEL_LINE: ${{ matrix.kernel }}
+          UPSTREAM_SOURCE: ${{ runner.temp }}/ksu-upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel_root="$RUNNER_TEMP/kernel-root"
+          common="$kernel_root/common"
+          mkdir -p "$common/drivers" "$common/kernel" "$common/fs" "$common/include/linux"
+          test -f "$UPSTREAM_SOURCE/kernel/Kconfig" || {
+            echo 'Pinned upstream does not contain kernel/Kconfig.' >&2
+            exit 1
+          }
+          ln -s "$UPSTREAM_SOURCE/kernel" "$common/drivers/kernelsu"
+          IFS=. read -r kernel_major kernel_minor <<< "$KERNEL_LINE"
+          printf 'VERSION = %s\nPATCHLEVEL = %s\nSUBLEVEL = 0\n' \
+            "$kernel_major" "$kernel_minor" > "$common/Makefile"
+          cat > "$common/kernel/seccomp.c" <<'EOF'
+          #include <linux/seccomp.h>
+          int __secure_computing(const struct seccomp_data *sd)
+          {
+              int mode = current->seccomp.mode;
+              int this_syscall;
+              this_syscall = sd ? sd->nr :
+                  syscall_get_nr(current, current_pt_regs());
+              return mode + this_syscall;
+          }
+          EOF
+          cat > "$common/fs/namespace.c" <<'EOF'
+          #include <linux/mount.h>
+          static int do_loopback(struct path *path, const char *old_name, int recurse)
+          {
+              struct path old_path;
+              int err;
+              err = kern_path(old_name, LOOKUP_FOLLOW|LOOKUP_AUTOMOUNT, &old_path);
+              if (err)
+                  return err;
+              err = 0;
+          out:
+              path_put(&old_path);
+              return err;
+          }
+          static int can_umount(const struct path *path, int flags)
+          {
+              if (!may_mount())
+                  return -EPERM;
+              return 0;
+          }
+          int path_umount(struct path *path, int flags)
+          {
+              struct mount *mnt = real_mount(path->mnt);
+              int ret;
+              ret = can_umount(path, flags);
+              if (!ret)
+                  ret = do_umount(mnt, flags);
+              return ret;
+          }
+          static inline bool may_mount(void)
+          {
+              return capable(CAP_SYS_ADMIN);
+          }
+          int path_mount(const char *dev_name, struct path *path,
+                         const char *type_page, unsigned long flags, void *data_page)
+          {
+              unsigned int mnt_flags = 0, sb_flags = 0;
+              int ret;
+              ret = security_sb_mount(dev_name, path, type_page, flags, data_page);
+              if (ret)
+                  return ret;
+              if (!may_mount())
+                  return -EPERM;
+              if (flags & MS_BIND)
+                  return do_loopback(path, dev_name, flags & MS_REC);
+              return do_new_mount(path, type_page, sb_flags, mnt_flags, dev_name,
+                                  data_page);
+          }
+          EOF
+          cat > "$common/kernel/ptrace.c" <<'EOF'
+          #include <linux/ptrace.h>
+          static int ptrace_may_access(struct task_struct *task)
+          {
+              const struct cred *tcred;
+              struct mm_struct *mm = task->mm;
+              unsigned int mode = 0;
+              tcred = __task_cred(task);
+              if (uid_eq(current_uid(), tcred->uid))
+                  goto ok;
+              return -EPERM;
+          ok:
+              if (mm &&
+                  ((get_dumpable(mm) != SUID_DUMP_USER) &&
+                   !ptrace_has_cap(mm->user_ns, mode)))
+                  return -EPERM;
+              return 0;
+          }
+          EOF
+          cat > "$common/kernel/signal.c" <<'EOF'
+          #include <linux/sched/signal.h>
+          static int check_kill_permission(struct task_struct *t)
+          {
+              if (!same_thread_group(current, t) &&
+                  !kill_ok_by_cred(t)) {
+                  return -EPERM;
+              }
+              return 0;
+          }
+          EOF
+          if [[ "$KERNEL_LINE" == 6.12 ]]; then
+            cat > "$common/include/linux/lsm_count.h" <<'EOF'
+          #if IS_ENABLED(CONFIG_SECURITY_IPE)
+          #define IPE_ENABLED 1,
+          #else
+          #define IPE_ENABLED
+          #endif
+
+          /*
+           *  There is a trailing comma that we need to be accounted for.
+          */
+          #define MAX_LSM_COUNT \
+              COUNT_LSMS( \
+                  IPE_ENABLED)
+          EOF
+          fi
+          printf '%s\n' \
+            'CONFIG_KSU=y' \
+            'CONFIG_SECURITY_SELINUX=y' \
+            'CONFIG_NAMESPACES=y' \
+            'CONFIG_KSU_ABK_SANDBOX=y' \
+            'CONFIG_LSM="yama,integrity,selinux,abk_ksu_sandbox"' \
+            > "$kernel_root/gki_defconfig"
+
+      - name: Install twice and verify pinned source
+        env:
+          EXPECTED_KERNEL: ${{ matrix.kernel }}
+          EXPECTED_VARIANT: ${{ matrix.ksu.detected }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel_root="$RUNNER_TEMP/kernel-root"
+          python3 scripts/install.py install \
+            --kernel-root "$kernel_root" \
+            --module-root "$GITHUB_WORKSPACE" \
+            --defconfig "$kernel_root/gki_defconfig"
+          python3 scripts/install.py install \
+            --kernel-root "$kernel_root" \
+            --module-root "$GITHUB_WORKSPACE" \
+            --defconfig "$kernel_root/gki_defconfig"
+          python3 scripts/install.py verify \
+            --kernel-root "$kernel_root" \
+            --module-root "$GITHUB_WORKSPACE" \
+            --defconfig "$kernel_root/gki_defconfig"
+          detection="$(python3 scripts/install.py detect --kernel-root "$kernel_root")"
+          [[ "$detection" == *"variant=$EXPECTED_VARIANT kernel=$EXPECTED_KERNEL "* ]] || {
+            echo "Unexpected detection: $detection" >&2
+            exit 1
+          }
+
+      - name: Record tested pin
+        if: always()
+        env:
+          KERNEL_LINE: ${{ matrix.kernel }}
+          VARIANT: ${{ matrix.ksu.name }}
+          UPSTREAM_COMMIT: ${{ matrix.ksu.commit }}
+        shell: bash
+        run: printf '%s Linux-%s %s\n' "$VARIANT" "$KERNEL_LINE" "$UPSTREAM_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+
+  linux-anchors:
+    name: Torvalds Linux ${{ matrix.kernel }} source anchors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel: '5.10'
+            commit: 2c85ebc57b3e1817b6ce1a6b703928e113a90442
+          - kernel: '5.15'
+            commit: 8bb7eca972ad531c9b149c0a51ab43a417385813
+          - kernel: '6.1'
+            commit: 830b3c68c1fb1e9176028d02ef86f3cf76aa2476
+          - kernel: '6.6'
+            commit: ffc253263a1375a65fa6c9f62a893e9767fbebfa
+          - kernel: '6.12'
+            commit: adc218676eef25575469234709c2d87185ca223a
+    steps:
+      - name: Check out module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Fetch pinned KernelSU source
+        env:
+          KSU_COMMIT: 953b403ab5ea2c1d866f72f6a7e67ce9224b8932
+        shell: bash
+        run: |
+          set -euo pipefail
+          ksu_source="$RUNNER_TEMP/ksu-upstream"
+          git init "$ksu_source"
+          git -C "$ksu_source" remote add origin https://github.com/tiann/KernelSU.git
+          git -C "$ksu_source" fetch --depth=1 origin "$KSU_COMMIT"
+          git -C "$ksu_source" checkout --detach FETCH_HEAD
+          test "$(git -C "$ksu_source" rev-parse HEAD)" = "$KSU_COMMIT"
+
+      - name: Fetch exact Linux source files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINUX_COMMIT: ${{ matrix.commit }}
+          LINUX_LINE: ${{ matrix.kernel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel_root="$RUNNER_TEMP/kernel-root"
+          common="$kernel_root/common"
+          files=(
+            Makefile
+            kernel/seccomp.c
+            fs/namespace.c
+            kernel/ptrace.c
+            kernel/signal.c
+          )
+          if [[ "$LINUX_LINE" == 6.12 ]]; then
+            files+=(include/linux/lsm_count.h)
+          fi
+          for source_file in "${files[@]}"; do
+            destination="$common/$source_file"
+            mkdir -p "$(dirname "$destination")"
+            curl --fail-with-body --location --retry 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github.raw+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/torvalds/linux/contents/$source_file?ref=$LINUX_COMMIT" \
+              --output "$destination"
+          done
+          mkdir -p "$common/drivers"
+          ln -s "$RUNNER_TEMP/ksu-upstream/kernel" "$common/drivers/kernelsu"
+          printf '%s\n' \
+            'CONFIG_KSU=y' \
+            'CONFIG_SECURITY_SELINUX=y' \
+            'CONFIG_NAMESPACES=y' \
+            'CONFIG_KSU_ABK_SANDBOX=y' \
+            'CONFIG_LSM="yama,integrity,selinux,abk_ksu_sandbox"' \
+            > "$kernel_root/gki_defconfig"
+
+      - name: Install twice and verify real anchors
+        env:
+          EXPECTED_KERNEL: ${{ matrix.kernel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel_root="$RUNNER_TEMP/kernel-root"
+          python3 scripts/install.py install \
+            --kernel-root "$kernel_root" \
+            --module-root "$GITHUB_WORKSPACE" \
+            --defconfig "$kernel_root/gki_defconfig"
+          python3 scripts/install.py install \
+            --kernel-root "$kernel_root" \
+            --module-root "$GITHUB_WORKSPACE" \
+            --defconfig "$kernel_root/gki_defconfig"
+          python3 scripts/install.py verify \
+            --kernel-root "$kernel_root" \
+            --module-root "$GITHUB_WORKSPACE" \
+            --defconfig "$kernel_root/gki_defconfig"
+          detection="$(python3 scripts/install.py detect --kernel-root "$kernel_root")"
+          [[ "$detection" == *"variant=official kernel=$EXPECTED_KERNEL "* ]] || {
+            echo "Unexpected detection: $detection" >&2
+            exit 1
+          }
+
+      - name: Record Linux pin and scope
+        if: always()
+        env:
+          LINUX_COMMIT: ${{ matrix.commit }}
+          LINUX_LINE: ${{ matrix.kernel }}
+        shell: bash
+        run: |
+          printf 'Torvalds Linux %s %s: source-anchor install/verify only; no Android tree, compilation, or boot.\n' \
+            "$LINUX_LINE" "$LINUX_COMMIT" >> "$GITHUB_STEP_SUMMARY"

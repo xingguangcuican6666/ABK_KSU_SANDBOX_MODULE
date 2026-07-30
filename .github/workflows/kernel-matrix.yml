@@ -1,0 +1,110 @@
+name: Supported arm64 kernel matrix
+
+on:
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-kernel-matrix
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require maintainer infrastructure configuration
+        env:
+          MATRIX_ENABLED: ${{ vars.ABK_KERNEL_MATRIX_ENABLED }}
+          KERNEL_SOURCE_TOKEN: ${{ secrets.ABK_KERNEL_SOURCE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$MATRIX_ENABLED" != true ]]; then
+            echo 'Supported kernel matrix is not configured: set repository variable ABK_KERNEL_MATRIX_ENABLED=true.' >&2
+            exit 1
+          fi
+          if [[ -z "$KERNEL_SOURCE_TOKEN" ]]; then
+            echo 'Supported kernel matrix is not configured: add secret ABK_KERNEL_SOURCE_TOKEN.' >&2
+            exit 1
+          fi
+
+  build:
+    needs: preflight
+    runs-on: [self-hosted, Linux, ARM64, abk-kernel-builder]
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        android: [android12, android13, android14, android15, android16]
+        kernel: ['5.10', '5.15', '6.1', '6.6', '6.12']
+        ksu:
+          - name: kernelsu
+            commit: 953b403ab5ea2c1d866f72f6a7e67ce9224b8932
+          - name: sukisu-ultra
+            commit: 35467545b2826e3acfc88699755981a889956b1a
+          - name: resukisu
+            commit: d5ba3d2d51a4c5b41a182112faa13c02b98e31a1
+        exclude:
+          - android: android12
+            kernel: '6.1'
+          - android: android12
+            kernel: '6.6'
+          - android: android12
+            kernel: '6.12'
+          - android: android13
+            kernel: '6.1'
+          - android: android13
+            kernel: '6.6'
+          - android: android13
+            kernel: '6.12'
+          - android: android14
+            kernel: '5.10'
+          - android: android14
+            kernel: '5.15'
+          - android: android14
+            kernel: '6.6'
+          - android: android14
+            kernel: '6.12'
+          - android: android15
+            kernel: '5.10'
+          - android: android15
+            kernel: '5.15'
+          - android: android15
+            kernel: '6.1'
+          - android: android15
+            kernel: '6.12'
+          - android: android16
+            kernel: '5.10'
+          - android: android16
+            kernel: '5.15'
+          - android: android16
+            kernel: '6.1'
+          - android: android16
+            kernel: '6.6'
+    steps:
+      - name: Check out module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run maintainer kernel build driver
+        env:
+          ABK_MATRIX_ANDROID: ${{ matrix.android }}
+          ABK_MATRIX_KERNEL: ${{ matrix.kernel }}
+          ABK_MATRIX_KSU: ${{ matrix.ksu.name }}
+          ABK_MATRIX_KSU_COMMIT: ${{ matrix.ksu.commit }}
+          ABK_KERNEL_SOURCE_TOKEN: ${{ secrets.ABK_KERNEL_SOURCE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix_driver=/opt/abk/bin/run-kernel-matrix
+          if [[ ! -x "$matrix_driver" ]]; then
+            echo "Required self-hosted build driver is missing or not executable: $matrix_driver" >&2
+            exit 1
+          fi
+          echo "Building $ABK_MATRIX_ANDROID / $ABK_MATRIX_KERNEL / $ABK_MATRIX_KSU@$ABK_MATRIX_KSU_COMMIT"
+          "$matrix_driver"

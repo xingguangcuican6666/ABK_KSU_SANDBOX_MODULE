@@ -1,0 +1,69 @@
+name: Lint and unit tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-unit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Validate shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t shell_files < <(find . -type f -name '*.sh' -not -path './.git/*' -print | sort)
+          ((${#shell_files[@]} > 0)) || { echo 'No shell files found' >&2; exit 1; }
+          bash -n "${shell_files[@]}"
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t shell_files < <(find . -type f -name '*.sh' -not -path './.git/*' -print | sort)
+          shellcheck --severity=warning "${shell_files[@]}"
+
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t python_files < <(find scripts tests -type f -name '*.py' -print | sort)
+          ((${#python_files[@]} > 0)) || { echo 'No Python files found' >&2; exit 1; }
+          python3 -m py_compile "${python_files[@]}"
+
+      - name: Validate module metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          source module.conf
+          test "$ABK_MODULE_ID" = 'abk_ksu_sandbox'
+          test "$ABK_MODULE_VERSION" = '0.1.0'
+          test "$ABK_MODULE_REPO_URL" = 'https://github.com/xingguangcuican6666/ABK_KSU_SANDBOX_MODULE'
+          test "$ABK_MODULE_SUPPORTED_STAGES" = 'after_patch,before_build'
+          test "$ABK_MODULE_RECOMMENDED_STAGES" = 'after_patch,before_build'
+          test -x setup.sh
+
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
