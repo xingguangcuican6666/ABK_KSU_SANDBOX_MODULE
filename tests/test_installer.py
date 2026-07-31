@@ -345,7 +345,7 @@ long ksu_supercall_handle_ioctl(unsigned int cmd, void __user *argp)
 /*
  *  There is a trailing comma that we need to be accounted for.
  */
-#define MAX_LSM_COUNT \\
+#define MAX_LSM_COUNT\t\t\t\\
 \tCOUNT_LSMS( \\
 \t\tIPE_ENABLED)
 """,

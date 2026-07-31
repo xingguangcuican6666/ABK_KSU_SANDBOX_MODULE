@@ -648,6 +648,21 @@ def replace_live_global(
     return text[:start] + new + text[start + len(old) :]
 
 
+def replace_live_regex_global(
+    path: Path,
+    text: str,
+    pattern: re.Pattern[str],
+    replacement_prefix: str,
+    error: str,
+) -> str:
+    live = mask_c_live_code(text, literals=False)
+    matches = list(pattern.finditer(live))
+    if len(matches) != 1:
+        raise InstallError(f"{error} in {path}")
+    match = matches[0]
+    return text[: match.start()] + replacement_prefix + text[match.start() :]
+
+
 def replace_live_regex_in_scope(
     path: Path,
     text: str,
@@ -1334,7 +1349,9 @@ def patch_lsm_count(common: Path, version: str) -> None:
     path = common / "include/linux/lsm_count.h"
     text = read(path)
     marker = f"{MARKER}: lsm count"
-    definition_anchor = "#define MAX_LSM_COUNT \\\n"
+    definition_pattern = re.compile(
+        r"(?m)^#define[ \t]+MAX_LSM_COUNT[ \t]+\\(?:\r?\n)"
+    )
     list_anchor = "\t\tIPE_ENABLED)"
     definition = f"""/* {marker} */
 #if IS_ENABLED(CONFIG_KSU_ABK_SANDBOX)
@@ -1353,11 +1370,11 @@ def patch_lsm_count(common: Path, version: str) -> None:
         global_counts=(("ABK_KSU_SANDBOX_ENABLED", 3),),
     ):
         return
-    text = replace_live_global(
+    text = replace_live_regex_global(
         path,
         text,
-        definition_anchor,
-        definition + definition_anchor,
+        definition_pattern,
+        definition,
         "LSM count definition anchor not found",
     )
     text = replace_live_global(
