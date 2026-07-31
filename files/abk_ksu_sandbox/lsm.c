@@ -33,6 +33,8 @@
 #include "security.h"
 
 #include "abk_sandbox.h"
+#include "lsm_build_config.h"
+#include "lsm_order.h"
 
 #define ABK_TMPFS_DATA_MAX PAGE_SIZE
 
@@ -550,21 +552,24 @@ static bool __init abk_lsm_list_contains(const char *list, const char *name)
 
 static int __init abk_lsm_finalize(void)
 {
-	const char *last;
-
 	if (!lsm_names || !abk_lsm_list_contains(lsm_names, "selinux")) {
 		pr_err("ABK KSU Sandbox: SELinux LSM is not active; sandbox entry disabled\n");
 		return 0;
 	}
-	last = strrchr(lsm_names, ',');
-	last = last ? last + 1 : lsm_names;
-	if (strcmp(last, "abk_ksu_sandbox")) {
-		pr_err("ABK KSU Sandbox: LSM must be last; sandbox entry disabled (active=%s)\n",
+	if (!abk_lsm_order_is_safe(lsm_names,
+				   ABK_KSU_ALLOW_RUNTIME_KSU_TAIL)) {
+		pr_err("ABK KSU Sandbox: unsafe LSM tail; expected sandbox%s (active=%s)\n",
+#if ABK_KSU_ALLOW_RUNTIME_KSU_TAIL
+		       "[,ksu]",
+#else
+		       "",
+#endif
 		       lsm_names);
 		return 0;
 	}
 	WRITE_ONCE(abk_lsm_ready, true);
-	pr_info("ABK KSU Sandbox: LSM mediation enabled\n");
+	pr_info("ABK KSU Sandbox: LSM mediation enabled (runtime_ksu_tail=%d)\n",
+		ABK_KSU_ALLOW_RUNTIME_KSU_TAIL);
 	return 0;
 }
 late_initcall(abk_lsm_finalize);

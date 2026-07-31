@@ -39,11 +39,13 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 安装/验证二次执行、未知或多个 KSU 树、LKM、缺失/较晚锚点的完整回滚、已有部分注入、
 外来或意外 sandbox 条目、未变源码重装时保留构建产物、源码变化时事务性失效旧产物、
 模板更新的 mtime、旧 Hook 规范化、损坏 Hook 的 verify 拒绝、两个 ABK 阶段、必需基础
-配置、6.12 `lsm_count.h` 和不支持的内核线。
+配置、6.12 `lsm_count.h`、ReSukiSU 动态 LSM 的源码/config/Kbuild 门控、运行时 LSM
+尾序与任意重复 token 判定，以及不支持的内核线。LSM 尾序测试会用主机 C 编译器编译
+并执行只依赖标准类型的 `lsm_order.h` 判定器。
 
-它不编译 C 源码，也不执行或模拟 SELinux policy、凭据转换、namespace 并发、撤权、
-mount/tmpfs 记账、ptrace/signal 或网络归属。上述项目只能由内核编译、内核级测试和真机
-验收覆盖，不能从 Python 单元测试通过中推断。
+除这个纯判定器外，它不编译内核 C 源码，也不执行或模拟 SELinux policy、凭据转换、
+namespace 并发、撤权、mount/tmpfs 记账、ptrace/signal 或网络归属。上述项目只能由
+内核编译、内核级测试和真机验收覆盖，不能从 Python 单元测试通过中推断。
 
 `.github/workflows/upstream-integration.yml` 有两个不同范围的任务：
 
@@ -131,13 +133,16 @@ anchors, an existing partial injection, foreign or unexpected sandbox entries,
 preservation of build artifacts for unchanged sources, transactional stale-
 artifact invalidation after source changes, source-update mtimes, normalization
 of old hooks, verify rejection of damaged hooks, both ABK stages, required base
-configuration, the 6.12 `lsm_count.h` edit, and an unsupported kernel line.
+configuration, the 6.12 `lsm_count.h` edit, the ReSukiSU dynamic-LSM
+source/config/Kbuild gate, runtime tail and arbitrary duplicate-token
+validation, and an unsupported kernel line. The LSM-tail test compiles and
+executes the standard-type-only `lsm_order.h` predicate with the host C compiler.
 
-It does not compile the C sources or execute/simulate SELinux policy, credential
-transitions, namespace concurrency, revocation, mount/tmpfs accounting,
-ptrace/signal mediation, or network attribution. Those require kernel builds,
-kernel-level tests, and device acceptance; Python unit success is not evidence
-for them.
+Apart from that pure predicate, it does not compile kernel C sources or
+execute/simulate SELinux policy, credential transitions, namespace concurrency,
+revocation, mount/tmpfs accounting, ptrace/signal mediation, or network
+attribution. Those require kernel builds, kernel-level tests, and device
+acceptance; Python unit success is not evidence for them.
 
 `.github/workflows/upstream-integration.yml` has two scopes:
 

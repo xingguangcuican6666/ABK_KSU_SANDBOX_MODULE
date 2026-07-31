@@ -18,7 +18,8 @@ final class DirectSuRunner implements SuRunner {
 
     @Override
     public CommandResult run(String script) throws Exception {
-        Process process = new ProcessBuilder("su", "-c", TimedProbeCommand.wrap(script))
+        Process process = new ProcessBuilder("/system/bin/su", "-c",
+                TimedProbeCommand.wrap(script))
                 .redirectErrorStream(true)
                 .start();
         OutputCollector collector = new OutputCollector(process.getInputStream());

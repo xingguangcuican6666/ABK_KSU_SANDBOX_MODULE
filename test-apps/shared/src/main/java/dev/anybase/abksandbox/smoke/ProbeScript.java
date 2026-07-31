@@ -33,11 +33,11 @@ public final class ProbeScript {
         script.append("identity=$(id 2>&1); info identity \"$identity\"\n");
         script.append("[ \"$(id -u)\" = 0 ] && pass euid-root || fail euid-root \"$(id -u)\"\n");
         script.append("[ \"$(id -g)\" = 0 ] && pass egid-root || fail egid-root \"$(id -g)\"\n");
-        script.append("primary_groups=$(id -G 2>/dev/null); [ \"$primary_groups\" = 0 ] && pass supplementary-groups-empty || fail supplementary-groups-empty \"$primary_groups\"\n");
+        script.append("groups_line=$(grep '^Groups:' /proc/self/status); info supplementary-groups \"$groups_line\"; groups_value=$(printf '%s\\n' \"$groups_line\" | sed 's/^Groups:[[:space:]]*//'); [ -z \"$groups_value\" ] && pass supplementary-groups-empty || fail supplementary-groups-empty \"$groups_line\"\n");
 
         script.append("ctx=$(cat /proc/self/attr/current 2>&1); info selinux-context \"$ctx\"\n");
         script.append("case \"$ctx\" in u:r:anybase_kernel_sandbox_${appid}:*) pass sandbox-context ;; *) fail sandbox-context \"$ctx\" ;; esac\n");
-        script.append("if [ -r /sys/kernel/security/lsm ]; then lsm_list=$(cat /sys/kernel/security/lsm 2>&1); info active-lsms \"$lsm_list\"; case \"$lsm_list\" in abk_ksu_sandbox|*,abk_ksu_sandbox) pass sandbox-lsm-last ;; *) fail sandbox-lsm-last \"$lsm_list\" ;; esac; else info sandbox-lsm-last \"/sys/kernel/security/lsm unreadable\"; fi\n");
+        script.append("if [ -r /sys/kernel/security/lsm ]; then lsm_list=$(cat /sys/kernel/security/lsm 2>&1); info active-lsms \"$lsm_list\"; case \"$lsm_list\" in abk_ksu_sandbox|*,abk_ksu_sandbox|abk_ksu_sandbox,ksu|*,abk_ksu_sandbox,ksu) pass sandbox-lsm-order ;; *) fail sandbox-lsm-order \"$lsm_list\" ;; esac; else info sandbox-lsm-order \"/sys/kernel/security/lsm unreadable\"; fi\n");
 
         script.append("uid_line=$(grep '^Uid:' /proc/self/status); gid_line=$(grep '^Gid:' /proc/self/status); info credential-uids \"$uid_line\"; info credential-gids \"$gid_line\"\n");
         script.append("set -- $uid_line; [ \"$2:$3:$4:$5\" = \"$uid:0:$uid:$uid\" ] && pass uid-shape-locked || fail uid-shape-locked \"$uid_line\"\n");

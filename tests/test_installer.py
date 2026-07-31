@@ -57,6 +57,8 @@ class SyntheticTree:
         for filename in (
             "Makefile",
             "abk_sandbox.h",
+            "lsm_build_config.h",
+            "lsm_order.h",
             "core.c",
             "policy.c",
             "namespace.c",
@@ -204,6 +206,38 @@ config KSU
 endmenu
 """,
         )
+        if variant == "resukisu":
+            self.write(
+                root / "hook/lsm_hooks.c",
+                """#include <linux/lsm_hooks.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0) || defined(KSU_COMPAT_HAS_LIST_OF_LSM_HOOKS)
+#include <linux/lsm_hooks.h>
+static struct security_hook_list ksu_hooks[] = {
+    LSM_HOOK_INIT(inode_rename, ksu_inode_rename),
+#ifdef CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK
+    LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),
+#endif
+#ifdef CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
+    LSM_HOOK_INIT(file_permission, ksu_file_permission),
+#endif
+};
+void __init ksu_lsm_hook_built_in_init(void)
+{
+    if (ARRAY_SIZE(ksu_hooks) == 0)
+        return;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0) || defined(KSU_COMPAT_REQUIRE_PROVIDE_LSM_NAME)
+    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");
+#else
+    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks));
+#endif
+}
+#else
+void __init ksu_lsm_hook_built_in_init(void)
+{
+}
+#endif
+""",
+            )
         self.write(
             root / "policy/app_profile.c",
             """#include <linux/cred.h>
@@ -274,17 +308,17 @@ long ksu_supercall_handle_ioctl(unsigned int cmd, void __user *argp)
         if variant == "resukisu":
             self.write(
                 root / "feature/sucompat.c",
-                """static int manual_su(void)
+                """static inline int do_ksu_handle_execveat_sucompat(struct pt_regs *regs)
 {
     escape_with_root_profile();
-    return 0;
+    return regs != 0;
 }
 """,
             )
         else:
             self.write(
                 root / "feature/sucompat.c",
-                """static long sucompat(struct pt_regs *regs)
+                """long ksu_handle_execve_sucompat(struct pt_regs *regs)
 {
     long ret, orig_regs[5];
     int tmp_fd = 0;
@@ -431,6 +465,82 @@ class InstallerTests(unittest.TestCase):
                 )
                 self.assertIn("abk_sandbox_current(NULL, NULL)", dispatch)
 
+    def test_supercall_comment_anchor_is_not_patched(self) -> None:
+        tree = self.make_tree()
+        dispatch = tree.ksu / "supercall/dispatch.c"
+        anchor = (
+            "long ksu_supercall_handle_ioctl(unsigned int cmd, void __user *argp)\n"
+            "{\n"
+        )
+        decoy = "/* decoy function anchor\n" + anchor + "*/\n"
+        dispatch.write_text(decoy + dispatch.read_text())
+
+        install = tree.command("install")
+
+        self.assertEqual(install.returncode, 0, install.stderr)
+        updated = dispatch.read_text()
+        self.assertIn(decoy, updated)
+        marker = "ABK_KSU_SANDBOX_V1: deny sandbox supercalls"
+        self.assertEqual(updated.count(marker), 1)
+        self.assertGreater(updated.index(marker), updated.index(decoy) + len(decoy))
+
+    def test_verify_rejects_sucompat_injection_moved_under_if_zero(self) -> None:
+        tree = self.make_tree()
+        sucompat = tree.ksu / "feature/sucompat.c"
+        unsafe = """    ret = escape_with_root_profile();
+    if (ret) {
+        pr_err("escape_with_root_profile failed: %ld\\n", ret);
+    }"""
+        install = tree.command("install")
+        self.assertEqual(install.returncode, 0, install.stderr)
+        baseline = tree.command("verify", verify_config=True)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        installed = sucompat.read_text()
+        start = installed.index("    ret = escape_with_root_profile();")
+        end = installed.index(
+            "\n    ksu_sulog_emit_pending(pending_sucompat, ret, GFP_KERNEL);",
+            start,
+        )
+        injection = installed[start:end]
+        sucompat.write_text(
+            installed[:start]
+            + "#if 0\n"
+            + injection
+            + "\n#endif\n"
+            + unsafe
+            + installed[end:]
+        )
+
+        verify = tree.command("verify", verify_config=True)
+
+        self.assertNotEqual(verify.returncode, 0, verify.stdout)
+
+    def test_verify_rejects_supercall_function_disabled_by_zero_suffix(self) -> None:
+        tree = self.make_tree()
+        dispatch = tree.ksu / "supercall/dispatch.c"
+        install = tree.command("install")
+        self.assertEqual(install.returncode, 0, install.stderr)
+        installed = dispatch.read_text()
+        function_start = installed.index("long ksu_supercall_handle_ioctl(")
+        disabled = installed[function_start:]
+        unsafe = """long
+ksu_supercall_handle_ioctl(unsigned int cmd, void __user *argp)
+{
+    return cmd + (argp != 0);
+}
+"""
+        dispatch.write_text(
+            installed[:function_start]
+            + "#if (0U)\n"
+            + disabled
+            + "#endif\n"
+            + unsafe
+        )
+
+        verify = tree.command("verify", verify_config=True)
+
+        self.assertNotEqual(verify.returncode, 0, verify.stdout)
+
     def test_rejects_unknown_ksu_source_shape(self) -> None:
         tree = self.make_tree("unknown")
         self.assert_failed_with(
@@ -490,6 +600,338 @@ class InstallerTests(unittest.TestCase):
         )
         self.assert_failed_with(
             tree.command("install"), "conflicting or partial ABK Kbuild injection"
+        )
+
+    def test_legacy_kbuild_block_is_upgraded(self) -> None:
+        tree = self.make_tree()
+        legacy = """# ABK_KSU_SANDBOX_V1
+ifneq ($(CONFIG_KSU_ABK_SANDBOX),y)
+$(error ABK KSU Sandbox requires CONFIG_KSU_ABK_SANDBOX=y; run both ABK stages)
+endif
+kernelsu-objs += abk_sandbox/core.o
+kernelsu-objs += abk_sandbox/policy.o
+kernelsu-objs += abk_sandbox/namespace.o
+kernelsu-objs += abk_sandbox/lsm.o
+"""
+        kbuild = tree.ksu / "Kbuild"
+        kbuild.write_text(kbuild.read_text().rstrip() + "\n" + legacy)
+
+        result = tree.command("install")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = kbuild.read_text()
+        self.assertEqual(updated.count("ABK_KSU_SANDBOX_V1"), 1)
+        self.assertIn("-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=0", updated)
+
+    def test_intermediate_kbuild_block_is_upgraded(self) -> None:
+        tree = self.make_tree()
+        intermediate = """# ABK_KSU_SANDBOX_V1
+ifneq ($(CONFIG_KSU_ABK_SANDBOX),y)
+$(error ABK KSU Sandbox requires CONFIG_KSU_ABK_SANDBOX=y; run both ABK stages)
+endif
+CFLAGS_abk_sandbox/lsm.o += -DABK_KSU_ALLOW_RUNTIME_KSU_TAIL=0
+kernelsu-objs += abk_sandbox/core.o
+kernelsu-objs += abk_sandbox/policy.o
+kernelsu-objs += abk_sandbox/namespace.o
+kernelsu-objs += abk_sandbox/lsm.o
+"""
+        kbuild = tree.ksu / "Kbuild"
+        kbuild.write_text(kbuild.read_text().rstrip() + "\n" + intermediate)
+
+        result = tree.command("install")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = kbuild.read_text()
+        self.assertEqual(updated.count("ABK_KSU_SANDBOX_V1"), 1)
+        self.assertNotIn("ABK_KSU_ALLOW_RUNTIME_KSU_TAIL", updated)
+        self.assertIn("-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=0", updated)
+
+    def test_resukisu_intermediate_kbuild_block_is_upgraded_idempotently(self) -> None:
+        tree = self.make_tree("resukisu", version="6.6")
+        intermediate = """# ABK_KSU_SANDBOX_V1
+ifneq ($(CONFIG_KSU_ABK_SANDBOX),y)
+$(error ABK KSU Sandbox requires CONFIG_KSU_ABK_SANDBOX=y; run both ABK stages)
+endif
+ifeq ($(CONFIG_KSU_MANUAL_HOOK),y)
+$(error ABK KSU Sandbox does not support ReSukiSU manual hook mode)
+endif
+ifeq ($(CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK),y)
+$(error ABK KSU Sandbox does not support ReSukiSU manual setuid LSM hooks)
+endif
+ifeq ($(CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK),y)
+$(error ABK KSU Sandbox does not support ReSukiSU manual initrc LSM hooks)
+endif
+ifeq ($(CONFIG_KSU_TRACEPOINT_HOOK),y)
+CFLAGS_abk_sandbox/lsm.o += -DABK_KSU_ALLOW_RUNTIME_KSU_TAIL=0
+else ifeq ($(CONFIG_KSU_SUSFS),y)
+CFLAGS_abk_sandbox/lsm.o += -DABK_KSU_ALLOW_RUNTIME_KSU_TAIL=1
+else
+CFLAGS_abk_sandbox/lsm.o += -DABK_KSU_ALLOW_RUNTIME_KSU_TAIL=0
+endif
+kernelsu-objs += abk_sandbox/core.o
+kernelsu-objs += abk_sandbox/policy.o
+kernelsu-objs += abk_sandbox/namespace.o
+kernelsu-objs += abk_sandbox/lsm.o
+"""
+        kbuild = tree.ksu / "Kbuild"
+        kbuild.write_text(kbuild.read_text().rstrip() + "\n" + intermediate)
+
+        migrated = tree.command("install")
+
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        updated = kbuild.read_text()
+        self.assertEqual(updated.count("ABK_KSU_SANDBOX_V1"), 1)
+        self.assertNotIn("ABK_KSU_ALLOW_RUNTIME_KSU_TAIL", updated)
+        self.assertIn("-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1", updated)
+        snapshot = tree.content_snapshot()
+
+        verified = tree.command("verify", verify_config=True)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        reinstalled = tree.command("install")
+        self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
+        self.assertEqual(snapshot, tree.content_snapshot())
+
+    def test_rejects_duplicate_current_kbuild_blocks(self) -> None:
+        tree = self.make_tree()
+        installed = tree.command("install")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        kbuild = tree.ksu / "Kbuild"
+        text = kbuild.read_text()
+        block = text[text.index("# ABK_KSU_SANDBOX_V1") :]
+        kbuild.write_text(text.rstrip() + "\n" + block)
+
+        self.assert_failed_with(
+            tree.command("install"), "conflicting or partial ABK Kbuild injection"
+        )
+        self.assert_failed_with(
+            tree.command("verify", verify_config=True),
+            "conflicting or partial ABK Kbuild injection",
+        )
+
+    def test_rejects_kbuild_block_nested_under_false_condition(self) -> None:
+        tree = self.make_tree()
+        installed = tree.command("install")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        kbuild = tree.ksu / "Kbuild"
+        text = kbuild.read_text()
+        start = text.index("# ABK_KSU_SANDBOX_V1")
+        kbuild.write_text(text[:start] + "ifeq (1,0)\n" + text[start:] + "endif\n")
+
+        self.assert_failed_with(
+            tree.command("verify", verify_config=True),
+            "ABK Kbuild block is nested in a conditional",
+        )
+
+    def test_rejects_kbuild_override_directive(self) -> None:
+        tree = self.make_tree()
+        kbuild = tree.ksu / "Kbuild"
+        kbuild.write_text(
+            kbuild.read_text().replace(
+                "kernelsu-objs := main.o", "override kernelsu-objs := main.o"
+            )
+        )
+
+        self.assert_failed_with(
+            tree.command("install"), "unsupported override directive"
+        )
+
+    def test_rejects_kconfig_block_nested_under_false_condition(self) -> None:
+        tree = self.make_tree()
+        installed = tree.command("install")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        kconfig = tree.ksu / "Kconfig"
+        text = kconfig.read_text()
+        start = text.index("# ABK_KSU_SANDBOX_V1")
+        end = text.index("endmenu", start)
+        kconfig.write_text(
+            text[:start] + "if BROKEN\n" + text[start:end] + "endif\n" + text[end:]
+        )
+
+        self.assert_failed_with(
+            tree.command("verify", verify_config=True),
+            "ABK Kconfig block is nested in a conditional",
+        )
+
+    def test_rejects_duplicate_required_defconfig_symbol(self) -> None:
+        tree = self.make_tree()
+        installed = tree.command("install")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        config = tree.kernel_root / "gki_defconfig"
+        config.write_text(config.read_text() + "# CONFIG_KSU is not set\n")
+
+        self.assert_failed_with(
+            tree.command("verify", verify_config=True),
+            "defconfig contains duplicate CONFIG_KSU entries",
+        )
+
+    def test_rejects_duplicate_legacy_kbuild_blocks(self) -> None:
+        tree = self.make_tree()
+        legacy = """# ABK_KSU_SANDBOX_V1
+ifneq ($(CONFIG_KSU_ABK_SANDBOX),y)
+$(error ABK KSU Sandbox requires CONFIG_KSU_ABK_SANDBOX=y; run both ABK stages)
+endif
+kernelsu-objs += abk_sandbox/core.o
+kernelsu-objs += abk_sandbox/policy.o
+kernelsu-objs += abk_sandbox/namespace.o
+kernelsu-objs += abk_sandbox/lsm.o
+"""
+        kbuild = tree.ksu / "Kbuild"
+        kbuild.write_text(kbuild.read_text().rstrip() + "\n" + legacy + legacy)
+
+        self.assert_failed_with(
+            tree.command("install"), "conflicting or partial ABK Kbuild injection"
+        )
+
+    def test_rejects_conflicting_runtime_tail_kbuild_blocks(self) -> None:
+        tree = self.make_tree(version="6.12")
+        installed = tree.command("install")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        resukisu = self.make_tree("resukisu", version="6.6")
+        resukisu_installed = resukisu.command("install")
+        self.assertEqual(resukisu_installed.returncode, 0, resukisu_installed.stderr)
+        resukisu_text = (resukisu.ksu / "Kbuild").read_text()
+        resukisu_block = resukisu_text[
+            resukisu_text.index("# ABK_KSU_SANDBOX_V1") :
+        ]
+
+        kbuild = tree.ksu / "Kbuild"
+        kbuild.write_text(kbuild.read_text().rstrip() + "\n" + resukisu_block)
+
+        self.assert_failed_with(
+            tree.command("install"), "conflicting or partial ABK Kbuild injection"
+        )
+        self.assert_failed_with(
+            tree.command("verify", verify_config=True),
+            "conflicting or partial ABK Kbuild injection",
+        )
+
+    def test_rejects_runtime_tail_definitions_outside_the_owned_block(self) -> None:
+        definitions = (
+            "subdir-ccflags-y += -DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1",
+            "CFLAGS_abk_sandbox/lsm.o += -DABK_KSU_ALLOW_RUNTIME_KSU_TAIL=1",
+        )
+        for definition in definitions:
+            with self.subTest(definition=definition):
+                tree = self.make_tree(version="6.12")
+                installed = tree.command("install")
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                kbuild = tree.ksu / "Kbuild"
+                kbuild.write_text(kbuild.read_text() + definition + "\n")
+
+                self.assert_failed_with(
+                    tree.command("install"),
+                    "conflicting or partial ABK Kbuild injection",
+                )
+                self.assert_failed_with(
+                    tree.command("verify", verify_config=True),
+                    "conflicting or partial ABK Kbuild injection",
+                )
+
+    def test_runtime_ksu_tail_requires_audited_resukisu_configuration(self) -> None:
+        tree = self.make_tree("resukisu", version="6.6")
+        config = tree.kernel_root / "gki_defconfig"
+
+        after_patch = tree.setup_stage("after_patch")
+
+        self.assertEqual(after_patch.returncode, 0, after_patch.stderr)
+        kbuild = (tree.ksu / "Kbuild").read_text()
+        self.assertIn("subdir-ccflags-y", kbuild)
+        self.assertIn("-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1", kbuild)
+        config.write_text(config.read_text() + "CONFIG_KSU_SUSFS=y\n")
+        before_build = tree.setup_stage("before_build")
+        self.assertEqual(before_build.returncode, 0, before_build.stderr)
+
+        def evaluate(
+            target: SyntheticTree, *assignments: str
+        ) -> subprocess.CompletedProcess[str]:
+            harness = target.base / "kbuild-eval.mk"
+            harness.write_text(
+                f"include {target.ksu / 'Kbuild'}\n"
+                "all:\n"
+                "\t@printf '%s\\n' '$(subdir-ccflags-y)'\n"
+            )
+            return subprocess.run(
+                [
+                    "make",
+                    "--no-print-directory",
+                    "-s",
+                    "-f",
+                    str(harness),
+                    "CONFIG_KSU_ABK_SANDBOX=y",
+                    *assignments,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        susfs = evaluate(tree, "CONFIG_KSU_SUSFS=y")
+        self.assertEqual(susfs.returncode, 0, susfs.stderr)
+        self.assertEqual(
+            susfs.stdout.strip(), "-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1"
+        )
+        tracepoint = evaluate(
+            tree, "CONFIG_KSU_TRACEPOINT_HOOK=y", "CONFIG_KSU_SUSFS=y"
+        )
+        self.assertEqual(tracepoint.returncode, 0, tracepoint.stderr)
+        self.assertEqual(
+            tracepoint.stdout.strip(),
+            "-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1",
+        )
+        manual = evaluate(tree, "CONFIG_KSU_MANUAL_HOOK=y")
+        self.assertNotEqual(manual.returncode, 0, manual.stdout)
+        self.assertIn("does not support ReSukiSU manual hook mode", manual.stderr)
+
+        for variant in ("official", "sukisu"):
+            with self.subTest(variant=variant):
+                other = self.make_tree(variant, version="6.6")
+                result = other.command("install", verify_config=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(
+                    "-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=0",
+                    (other.ksu / "Kbuild").read_text(),
+                )
+                evaluated = evaluate(other, "CONFIG_KSU_SUSFS=y")
+                self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
+                self.assertEqual(
+                    evaluated.stdout.strip(),
+                    "-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=0",
+                )
+
+        modern = self.make_tree("resukisu", version="6.12")
+        modern_config = modern.kernel_root / "gki_defconfig"
+        modern_config.write_text(modern_config.read_text() + "CONFIG_KSU_SUSFS=y\n")
+        result = modern.command("install", verify_config=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "-DABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=0",
+            (modern.ksu / "Kbuild").read_text(),
+        )
+
+    def test_runtime_ksu_tail_rejects_changed_or_overlapping_hooks(self) -> None:
+        changed = self.make_tree("resukisu", version="6.6")
+        changed_config = changed.kernel_root / "gki_defconfig"
+        changed_config.write_text(changed_config.read_text() + "CONFIG_KSU_SUSFS=y\n")
+        hooks = changed.ksu / "hook/lsm_hooks.c"
+        hooks.write_text(
+            hooks.read_text().replace(
+                "    LSM_HOOK_INIT(inode_rename, ksu_inode_rename),\n",
+                "    LSM_HOOK_INIT(inode_rename, ksu_inode_rename),\n"
+                "    LSM_HOOK_INIT(bprm_committing_creds, ksu_bprm_committing_creds),\n",
+            )
+        )
+        self.assert_failed_with(
+            changed.command("install", verify_config=True),
+            "unsupported ReSukiSU runtime LSM hook shape",
+        )
+
+        manual = self.make_tree("resukisu", version="6.6")
+        manual_config = manual.kernel_root / "gki_defconfig"
+        manual_config.write_text(manual_config.read_text() + "CONFIG_KSU_MANUAL_HOOK=y\n")
+        self.assert_failed_with(
+            manual.command("install", verify_config=True),
+            "ReSukiSU manual LSM credential hooks are unsupported",
         )
 
     def test_rejects_foreign_sandbox_directory(self) -> None:
@@ -870,6 +1312,101 @@ class InstallerTests(unittest.TestCase):
         lsm_count = (tree.common / "include/linux/lsm_count.h").read_text()
         self.assertEqual(lsm_count.count("ABK_KSU_SANDBOX_V1: lsm count"), 1)
 
+    def test_verify_rejects_lsm_count_comment_spoof(self) -> None:
+        tree = self.make_tree(version="6.12")
+        lsm_count = tree.common / "include/linux/lsm_count.h"
+        original = lsm_count.read_text()
+        install = tree.command("install")
+        self.assertEqual(install.returncode, 0, install.stderr)
+        baseline = tree.command("verify", verify_config=True)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        lsm_count.write_text(
+            original
+            + "\n/* ABK_KSU_SANDBOX_V1: lsm count */\n"
+            + "/* ABK_KSU_SANDBOX_ENABLED ABK_KSU_SANDBOX_ENABLED "
+            + "ABK_KSU_SANDBOX_ENABLED */\n"
+        )
+
+        verify = tree.command("verify", verify_config=True)
+
+        self.assertNotEqual(verify.returncode, 0, verify.stdout)
+
+    def test_verify_rejects_missing_mount_result_call(self) -> None:
+        tree = self.make_tree()
+        namespace = tree.common / "fs/namespace.c"
+        install = tree.command("install")
+        self.assertEqual(install.returncode, 0, install.stderr)
+        baseline = tree.command("verify", verify_config=True)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        installed = namespace.read_text()
+        call = "abk_ksu_sandbox_mount_result(path, ret);"
+        self.assertEqual(installed.count(call), 3)
+        namespace.write_text(installed.replace(call, "/* removed mount-result */", 1))
+
+        verify = tree.command("verify", verify_config=True)
+
+        self.assertNotEqual(verify.returncode, 0, verify.stdout)
+
+    def test_resukisu_rejects_extra_security_hook_registration(self) -> None:
+        cases = (
+            ("c", "security_add_hooks"),
+            ("h", "security_add_hooks"),
+            ("inc", "security_add_hooks"),
+            ("c", "security_add_\\\nhooks"),
+        )
+        for suffix, registration in cases:
+            with self.subTest(suffix=suffix, registration=registration):
+                tree = self.make_tree("resukisu")
+                extra = tree.ksu / f"feature/extra_registration.{suffix}"
+                extra.write_text(
+                    "static struct security_hook_list extra_hooks[];\n"
+                    "static void extra_registration(void)\n"
+                    "{\n"
+                    f"    {registration}(extra_hooks, ARRAY_SIZE(extra_hooks), "
+                    '"k" "su");\n'
+                    "}\n"
+                )
+
+                result = tree.command("install", verify_config=True)
+
+                self.assert_failed_with(
+                    result, "unsupported ReSukiSU runtime LSM hook shape"
+                )
+
+    def test_resukisu_rejects_disabled_audited_hook_array(self) -> None:
+        for guard in ("#if 0U", "#ifdef CONFIG_NEVER_ENABLED"):
+            with self.subTest(guard=guard):
+                tree = self.make_tree("resukisu")
+                hooks = tree.ksu / "hook/lsm_hooks.c"
+                original = hooks.read_text()
+                array_start = original.index(
+                    "static struct security_hook_list ksu_hooks[]"
+                )
+                array_end = original.index(
+                    "void __init ksu_lsm_hook_built_in_init", array_start
+                )
+                audited_array = original[array_start:array_end]
+                unsafe_array = """static struct security_hook_list ksu_hooks[] __ro_after_init = {
+    LSM_HOOK_INIT(inode_rename, ksu_inode_rename),
+    LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),
+};
+"""
+                hooks.write_text(
+                    original[:array_start]
+                    + guard
+                    + "\n"
+                    + audited_array
+                    + "#endif\n"
+                    + unsafe_array
+                    + original[array_end:]
+                )
+
+                result = tree.command("install", verify_config=True)
+
+                self.assert_failed_with(
+                    result, "unsupported ReSukiSU runtime LSM hook shape"
+                )
+
     def test_template_keeps_runtime_security_guards(self) -> None:
         sources = REPOSITORY / "files/abk_ksu_sandbox"
         core = (sources / "core.c").read_text()
@@ -881,11 +1418,188 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(".order = LSM_ORDER_MUTABLE", lsm)
         self.assertIn("WRITE_ONCE(abk_lsm_ready, true)", lsm)
         self.assertIn("late_initcall(abk_lsm_finalize)", lsm)
-        self.assertIn('strcmp(last, "abk_ksu_sandbox")', lsm)
+        self.assertIn("ABK_KSU_ALLOW_RUNTIME_KSU_TAIL", lsm)
+        self.assertIn("abk_lsm_order_is_safe(lsm_names,", lsm)
+        self.assertIn('expected sandbox%s', lsm)
         self.assertNotIn("MNT_DETACH", lsm)
         self.assertNotIn("MNT_DETACH", namespace)
         self.assertIn("bitmap_weight(abk_owned_types", policy)
         self.assertIn("ABK_SANDBOX_MAX_INSTANCES", policy)
+
+    def test_runtime_lsm_build_config_requires_source_and_susfs(self) -> None:
+        source_dir = REPOSITORY / "files/abk_ksu_sandbox"
+        cases = (
+            ((), 0),
+            (("ABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1",), 0),
+            (
+                (
+                    "ABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1",
+                    "CONFIG_KSU_SUSFS=1",
+                ),
+                1,
+            ),
+            (
+                (
+                    "ABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1",
+                    "CONFIG_KSU_SUSFS=1",
+                    "CONFIG_KSU_TRACEPOINT_HOOK=1",
+                ),
+                0,
+            ),
+            (
+                (
+                    "ABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1",
+                    "CONFIG_KSU_SUSFS=1",
+                    "CONFIG_KSU_MANUAL_HOOK=1",
+                ),
+                0,
+            ),
+            (
+                (
+                    "ABK_KSU_RUNTIME_TAIL_SOURCE_VERIFIED=1",
+                    "CONFIG_KSU_SUSFS=1",
+                    "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=1",
+                ),
+                0,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / "lsm_build_config_test.c"
+            harness.write_text(
+                """#include "lsm_build_config.h"
+#if ABK_KSU_ALLOW_RUNTIME_KSU_TAIL != EXPECTED
+#error "unexpected runtime KSU tail policy"
+#endif
+int main(void) { return 0; }
+"""
+            )
+            for index, (defines, expected) in enumerate(cases):
+                with self.subTest(defines=defines, expected=expected):
+                    binary = root / f"lsm_build_config_test_{index}"
+                    command = [
+                        os.environ.get("CC", "cc"),
+                        "-std=c11",
+                        "-Wall",
+                        "-Wextra",
+                        "-Werror",
+                        "-I",
+                        str(source_dir),
+                        f"-DEXPECTED={expected}",
+                    ]
+                    command.extend(f"-D{define}" for define in defines)
+                    command.extend((str(harness), "-o", str(binary)))
+                    result = subprocess.run(
+                        command, check=False, capture_output=True, text=True
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+
+    def test_runtime_lsm_order_accepts_only_optional_ksu_tail(self) -> None:
+        source_dir = REPOSITORY / "files/abk_ksu_sandbox"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / "lsm_order_test.c"
+            binary = root / "lsm_order_test"
+            harness.write_text(
+                """#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "lsm_order.h"
+
+struct test_case {
+    const char *list;
+    bool allow_ksu_tail;
+    bool expected;
+};
+
+int main(void)
+{
+    static const struct test_case cases[] = {
+        { "capability,selinux,abk_ksu_sandbox", false, true },
+        { "capability,selinux,abk_ksu_sandbox,ksu", true, true },
+        { "capability,selinux,abk_ksu_sandbox,ksu", false, false },
+        { "capability,selinux,ksu,abk_ksu_sandbox", false, true },
+        { "capability,selinux,abk_ksu_sandbox,bpf", true, false },
+        { "capability,selinux,abk_ksu_sandbox,ksu,bpf", true, false },
+        { "capability,selinux,abk_ksu_sandbox,ksu,ksu", true, false },
+        { "capability,selinux,abk_ksu_sandbox,abk_ksu_sandbox", true, false },
+        { "capability,selinux,abk_ksu_sandbox,landlock,ksu", true, false },
+        { "capability,selinux,selinux,abk_ksu_sandbox", false, false },
+        { "capability,bpf,bpf,selinux,abk_ksu_sandbox", false, false },
+        { "capability,selinux,,abk_ksu_sandbox", false, false },
+        { "capability,selinux,abk_ksu_sandbox,", false, false },
+        { "capability,selinux,ksu", true, false },
+        { "", false, false },
+    };
+    size_t index;
+
+    for (index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        bool actual = abk_lsm_order_is_safe(
+            cases[index].list, cases[index].allow_ksu_tail);
+
+        if (actual != cases[index].expected) {
+            fprintf(stderr, "case %zu failed: %s\\n", index, cases[index].list);
+            return (int)index + 1;
+        }
+    }
+    return 0;
+}
+"""
+            )
+            compile_result = subprocess.run(
+                [
+                    os.environ.get("CC", "cc"),
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-I",
+                    str(source_dir),
+                    str(harness),
+                    "-o",
+                    str(binary),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                compile_result.returncode,
+                0,
+                compile_result.stdout + compile_result.stderr,
+            )
+            run_result = subprocess.run(
+                [str(binary)], check=False, capture_output=True, text=True
+            )
+            self.assertEqual(
+                run_result.returncode,
+                0,
+                run_result.stdout + run_result.stderr,
+            )
+
+    def test_device_runners_require_the_kernel_su_entrypoint(self) -> None:
+        direct = (
+            REPOSITORY
+            / "test-apps/direct/src/main/java/dev/anybase/abksandbox/direct/DirectSuRunner.java"
+        ).read_text()
+        libsu = (
+            REPOSITORY
+            / "test-apps/libsu/src/main/java/dev/anybase/abksandbox/libsu/LibsuRunner.java"
+        ).read_text()
+        probe = (
+            REPOSITORY
+            / "test-apps/shared/src/main/java/dev/anybase/abksandbox/smoke/ProbeScript.java"
+        ).read_text()
+
+        self.assertIn('new ProcessBuilder("/system/bin/su", "-c",', direct)
+        self.assertIn('.build("/system/bin/su")', libsu)
+        self.assertIn("if (!shell.isRoot())", libsu)
+        self.assertNotIn("id -G", probe)
+        self.assertIn("'^Groups:'", probe)
 
     def test_rejects_unsupported_kernel_line(self) -> None:
         tree = self.make_tree(version="6.5")

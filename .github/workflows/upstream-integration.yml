@@ -73,6 +73,7 @@ jobs:
       - name: Create minimal built-in kernel tree
         env:
           KERNEL_LINE: ${{ matrix.kernel }}
+          KSU_VARIANT: ${{ matrix.ksu.detected }}
           UPSTREAM_SOURCE: ${{ runner.temp }}/ksu-upstream
         shell: bash
         run: |
@@ -217,6 +218,9 @@ jobs:
             'CONFIG_KSU_ABK_SANDBOX=y' \
             'CONFIG_LSM="yama,integrity,selinux,abk_ksu_sandbox"' \
             > "$kernel_root/gki_defconfig"
+          if [[ "$KSU_VARIANT" == resukisu ]]; then
+            printf '%s\n' 'CONFIG_KSU_SUSFS=y' >> "$kernel_root/gki_defconfig"
+          fi
 
       - name: Install twice and verify pinned source
         env:

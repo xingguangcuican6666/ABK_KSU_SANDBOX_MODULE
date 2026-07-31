@@ -40,8 +40,14 @@ eBPF、内核控制以及 domain transition。SELinux 不是 enforcing 时拒绝
 
 动态 policy 写入必须幂等并带模块标记；未知已有规则、名称冲突或只能完成部分规则时
 立即失败。日志必须限速，且不提供 sysfs 开关或运行时绕过接口。
-LSM 按标准 `CONFIG_LSM` 顺序加载并位于列表最后；若启动参数移除或重排模块，late init
-不会标记其就绪，匹配的提权请求必须拒绝，不能以缺少或错误排序的 LSM 约束继续执行。
+`CONFIG_LSM` 必须把 `abk_ksu_sandbox` 放在静态列表最后。默认运行时也只接受
+`...,abk_ksu_sandbox`。唯一例外是 5.10–6.6 的 ReSukiSU SUSFS 构建：安装器先验证
+`hook/lsm_hooks.c` 只有已审计的动态 `ksu` hook 形状，目标 Kbuild 通过
+`subdir-ccflags-y` 传递源码审计位；`lsm.c` 再根据最终 Kconfig 结果仅对
+`CONFIG_KSU_SUSFS=y` 启用兼容。Tracepoint 保持关闭，Manual 及其 credential hook
+直接构建失败。只有此时才接受 `...,abk_ksu_sandbox,ksu`。Official、
+SukiSU、ReSukiSU 6.12 或源码形状变化均不获得该例外。若启动参数移除或重排模块，或
+出现任何其他后置、重复 LSM，late init 不会标记其就绪；匹配的提权请求必须拒绝。
 
 ### 凭据、namespace 与受限操作
 
@@ -101,10 +107,17 @@ denied. Matching app elevation is denied unless SELinux is enforcing.
 Dynamic policy writes must be idempotent and carry module-owned markers. Unknown
 existing rules, naming conflicts, or partial rule installation fail closed.
 Kernel logs are rate-limited; there is no sysfs switch or runtime bypass.
-The LSM loads last through the standard `CONFIG_LSM` order. If a boot-parameter
-override omits or reorders it, late initialization does not mark it ready and
-matching elevation requests are denied instead of continuing with missing or
-misordered mediation.
+`CONFIG_LSM` must place `abk_ksu_sandbox` last in the static list. The default
+runtime requirement is also `...,abk_ksu_sandbox`. The sole exception is a
+ReSukiSU SUSFS build on 5.10-6.6. The installer first verifies the audited
+dynamic `ksu` hook shape in `hook/lsm_hooks.c`; target Kbuild propagates a
+source-audited bit through `subdir-ccflags-y`, and `lsm.c` enables compatibility
+only when the final Kconfig result has `CONFIG_KSU_SUSFS=y`. Tracepoint keeps it
+disabled, while Manual and its credential hooks fail the build. Only that case accepts
+`...,abk_ksu_sandbox,ksu`. Official, SukiSU, ReSukiSU 6.12, and changed source
+shapes receive no exception. A boot override that omits or reorders the module,
+any other trailing LSM, or any duplicate LSM keeps late initialization unready
+and matching elevation requests are denied.
 
 ### Credentials, namespaces, and mediated operations
 

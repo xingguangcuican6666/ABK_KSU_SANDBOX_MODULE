@@ -64,9 +64,13 @@ final class LibsuRunner implements SuRunner {
         Shell shell = Shell.Builder.create()
                 .setFlags(Shell.FLAG_REDIRECT_STDERR)
                 .setTimeout(20)
-                .build();
+                .build("/system/bin/su");
         activeShell.set(shell);
         try {
+            if (!shell.isRoot()) {
+                throw new IOException(
+                        "KernelSU root shell unavailable; refusing non-root fallback");
+            }
             if (Thread.currentThread().isInterrupted()) {
                 throw new InterruptedException("libsu probe cancelled during shell startup");
             }

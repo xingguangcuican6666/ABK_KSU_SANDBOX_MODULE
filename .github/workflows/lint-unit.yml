@@ -52,7 +52,7 @@ jobs:
           set -euo pipefail
           source module.conf
           test "$ABK_MODULE_ID" = 'abk_ksu_sandbox'
-          test "$ABK_MODULE_VERSION" = '0.1.0'
+          test "$ABK_MODULE_VERSION" = '0.1.1'
           test "$ABK_MODULE_REPO_URL" = 'https://github.com/xingguangcuican6666/ABK_KSU_SANDBOX_MODULE'
           test "$ABK_MODULE_SUPPORTED_STAGES" = 'after_patch,before_build'
           test "$ABK_MODULE_RECOMMENDED_STAGES" = 'after_patch,before_build'

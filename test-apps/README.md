@@ -3,8 +3,9 @@
 These two deliberately small Android applications exercise the two supported `su`
 entry paths:
 
-- `direct` starts `ProcessBuilder("su", "-c", script)` directly.
-- `libsu` starts the same script through `com.github.topjohnwu.libsu`.
+- `direct` starts `ProcessBuilder("/system/bin/su", "-c", script)` directly.
+- `libsu` explicitly opens `/system/bin/su` through
+  `com.github.topjohnwu.libsu` and rejects its non-root shell fallback.
 
 They are validation fixtures, not production applications. The exported peer service,
 plain-text diagnostics, fixed package names, and intentionally hostile syscall probes
@@ -25,6 +26,10 @@ Extract that workflow artifact, then install both APKs:
 adb install -r direct/build/outputs/apk/debug/direct-debug.apk
 adb install -r libsu/build/outputs/apk/debug/libsu-debug.apk
 ```
+
+If Android reports a debug-signature mismatch with an older workflow artifact,
+uninstall both old fixtures, install the new APKs, and authorize them again in
+KernelSU.
 
 The workflow resolves libsu `5.2.2` from JitPack; that repository is content-filtered
 to the `com.github.topjohnwu.libsu` group. No application dependency is shared
@@ -53,7 +58,9 @@ The probes report and check:
 - effective identity plus `/proc/self/status` UID, GID, supplementary groups, and all
   capability sets;
 - the exact dynamic SELinux domain from `/proc/self/attr/current`;
-- the runtime LSM list ends in `abk_ksu_sandbox` when the list is readable;
+- the runtime LSM list ends in `abk_ksu_sandbox`, or in
+  `abk_ksu_sandbox,ksu` only for the installer-validated ReSukiSU
+  5.10-6.6/SUSFS compatibility path, when the list is readable;
 - mount namespace inode separation and preservation of the app's seccomp mode;
 - a permitted 1 MiB tmpfs mount below the caller's own cache directory;
 - rejection of lazy unmount while normal cleanup remains permitted;
@@ -70,7 +77,14 @@ its global cached shell. A watchdog timeout normally exits as `143` (`SIGTERM`) 
 `137` (`SIGKILL`); launcher fallback uses `124`. Direct output is retained up to
 1 MiB and then drained with an explicit truncation marker. The credential checks
 require real/saved/fs UID/GID to remain the application identity while only effective
-UID/GID become zero. Tmpfs options use the original UID and GID independently.
+UID/GID become zero. Supplementary groups are read from the `Groups:` field in
+`/proc/self/status`; `id -G` also prints the primary/effective group and is not a
+valid empty-supplementary-group check. Tmpfs options use the original UID and GID
+independently.
+
+For a manual Termux check, run `/system/bin/su` explicitly. A bare `su` can report
+`not found` because Termux's PATH does not necessarily include `/system/bin`; that
+message alone does not show whether KernelSU accepted or rejected the request.
 
 The legal mount is always unmounted before the probe exits. If an invalid bind mount
 unexpectedly succeeds, the test reports `FAIL` and immediately attempts to unmount it
